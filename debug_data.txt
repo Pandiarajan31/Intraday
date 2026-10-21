@@ -1,0 +1,4 @@
+[I 260821 12:11:39 smartConnect:124] in pool
+d1 error? None
+m15 error? None
+m5 error? None

@@ -1,0 +1,11 @@
+[I 260821 13:04:22 smartConnect:124] in pool
+Traceback (most recent call last):
+  File "<string>", line 22, in <module>
+AttributeError: type object 'AngelOneApi' has no attribute 'create_client'
+Inspecting DataProvider.get_ohlcv for 15m...
+m15 type: <class 'dict'>
+m15 keys: ['symbol', 'symbol_input', 'exchange', 'market', 'start', 'end', 'interval', 'total_candles', 'count', 'candles', 'source']
+m15 error: None
+m15 candles length: 100
+
+--- Testing raw broker class ---

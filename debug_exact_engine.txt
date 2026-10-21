@@ -1,0 +1,28 @@
+[I 260821 12:46:31 smartConnect:124] in pool
+Testing exactly what engine.py does...
+daily type: <class 'dict'>
+daily keys: ['symbol', 'symbol_input', 'exchange', 'market', 'start', 'end', 'interval', 'total_candles', 'count', 'candles', 'source']
+daily error: None
+daily candles type: <class 'list'>
+daily candles length: 65
+First daily candle: {'timestamp': '2026-05-21T00:00:00+05:30', 'open': 767.0, 'high': 768.25, 'low': 755.15, 'close': 759.15, 'volume': 34664725}
+Last daily candle: {'timestamp': '2026-08-21T00:00:00+05:30', 'open': 728.3, 'high': 732.8, 'low': 726.6, 'close': 731.4, 'volume': 20036544}
+
+==================================================
+m15 type: <class 'dict'>
+m15 keys: ['symbol', 'symbol_input', 'exchange', 'market', 'error', 'candles', 'count']
+m15 error: Angel One candles unavailable: Couldn't parse the JSON response received from the server: b'Access denied because of exceeding access rate'
+m15 candles type: <class 'list'>
+m15 candles length: 0
+
+==================================================
+m5 type: <class 'dict'>
+m5 keys: ['symbol', 'symbol_input', 'exchange', 'market', 'start', 'end', 'interval', 'total_candles', 'count', 'candles', 'source']
+m5 error: None
+m5 candles type: <class 'list'>
+m5 candles length: 100
+First 5m candle: {'timestamp': '2026-08-20T10:30:00+05:30', 'open': 727.45, 'high': 727.5, 'low': 727.0, 'close': 727.2, 'volume': 81831}
+Last 5m candle: {'timestamp': '2026-08-21T12:45:00+05:30', 'open': 731.25, 'high': 731.5, 'low': 731.25, 'close': 731.45, 'volume': 34528}
+
+==================================================
+quote: {'symbol': 'HDFCBANK', 'symbol_input': 'HDFCBANK', 'exchange': 'NSE', 'market': 'INDIA', 'last_price': 731.45, 'previous_close': 725.05, 'open': 728.3, 'day_high': 732.8, 'day_low': 726.6, 'volume': 0, 'timestamp': '2026-08-21T12:46:32.436783+05:30', 'source': 'angelone'}

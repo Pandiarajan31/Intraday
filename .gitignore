@@ -1,0 +1,8 @@
+.env
+.cache/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+venv/
+
+# Backtest historical candle cache (fetched from Angel One, regenerable)

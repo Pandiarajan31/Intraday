@@ -1,0 +1,176 @@
+{
+  "settings": {
+    "data_source": "angelone",
+    "paper_risk": {
+      "account_equity": 100000,
+      "risk_per_trade_percent": 0.5,
+      "max_daily_loss_percent": 2.0,
+      "max_open_positions": 3,
+      "max_position_value_percent": 20.0
+    },
+    "min_price": 50.0,
+    "min_avg_volume": 100000,
+    "min_avg_traded_value": 10000000,
+    "universe_filter": "NIFTY100",
+    "max_symbols": 15,
+    "max_spread_percent": 0.5,
+    "max_data_age_seconds": 300,
+    "market_bias": "UNKNOWN",
+    "watchlist_size": 15,
+    "watch_start_time": "09:15",
+    "candidate_pool_size": 80,
+    "candidate_score_weights": {
+      "liquidity": 20,
+      "atr_suitability": 15,
+      "prevday_trend": 15,
+      "relative_strength": 15,
+      "sector_strength": 10,
+      "gap_quality": 10,
+      "premarket_activity": 5,
+      "event_risk": 5,
+      "prevday_participation": 5
+    },
+    "dynamic_scan_enabled": true,
+    "dynamic_opportunity_pool_size": 10,
+    "dynamic_min_rvol": 1.5,
+    "_comment": "Canonical engine thresholds - these are read exactly as specified. min_rr takes precedence over min_risk_reward if both exist.",
+    "_gate_mode_comment": "gate_mode: 'strict' = all conditions mandatory (legacy). 'tiered' = only hard_gate_must_haves block; the rest become score boosters (each failed booster = -booster_penalty). Task 8 tunes this with the backtest.",
+    "gate_mode": "strict",
+    "hard_gate_must_haves": [
+      "liquidity", "session", "atr", "daily_trend", "15m_trend",
+      "vwap", "current_rr", "rr"
+    ],
+    "booster_penalty": 7,
+    "min_rvol": 1.3,
+    "preferred_rvol": 2.0,
+    "min_rr": 1.8,
+    "preferred_rr": 2.5,
+    "buy_score_threshold": 60,
+    "sell_score_threshold": 60,
+    "almost_min_score": 55,
+    "max_entry_extension_atr": 0.5,
+    "exhaustion_vwap_atr": 2.0,
+    "exhaustion_range_used": 0.8,
+    "exhaustion_run_bars": 5,
+    "exhaustion_block_score": 50,
+    "entry_zone_good_score": 75,
+    "entry_zone_early_score": 65,
+    "entry_zone_min_score": 55,
+    "entry_zone_early_distance_pct": 0.3,
+    "entry_zone_max_vwap_atr": 1.5,
+    "entry_zone_min_net_rr": 1.5,
+    "round_trip_cost_pct": 0.08,
+    "structural_stop_lookback": 6,
+    "structural_stop_buffer_atr": 0.2,
+    "structural_stop_min_atr": 0.6,
+    "structural_stop_max_atr": 2.0,
+    "trail_lookback_candles": 3,
+    "time_stop_minutes": 30,
+    "time_stop_min_progress_r": 0.5,
+    "lunch_start_time": "12:00",
+    "lunch_end_time": "13:30",
+    "lunch_score_bonus": 5,
+    "index_rs_override_pct": 1.0,
+    "banknifty_symbol": "^NSEBANK",
+    "max_trades_per_day": 4,
+    "max_consecutive_losses": 3,
+    "min_body_ratio": 0.5,
+    "allow_counter_trend": false,
+    "use_market_regime_filter": true,
+    "entry_start_time": "09:45",
+    "entry_end_time": "14:30",
+    "square_off_time": "15:15",
+    "atr_5m_multiplier": 0.5,
+    "confirm_candle_breakout_pct": 0.15,
+    "cancel_candle_breakdown_pct": 0.2,
+    "max_event_risk": "HIGH",
+    "atr_multiplier_sl": 1.0,
+    "atr_multiplier_targets": [
+      1.0,
+      1.5,
+      2.0
+    ],
+    "position_check_interval_seconds": 20,
+    "atr_period": 14,
+    "ema_fast": 20,
+    "ema_slow": 50,
+    "rsi_bull_min": 50,
+    "rsi_bear_max": 50,
+    "gap_up_threshold": 0.5,
+    "strong_gap_up_threshold": 1.5,
+    "resistance_lookback": 20,
+    "breakout_tolerance_percent": 0.05,
+    "premarket_enabled": true,
+    "patterns": {
+      "enabled": {
+        "orb": true,
+        "pdh_pdl": true,
+        "breakout_retest": true,
+        "vwap_pullback": true,
+        "ema20_pullback": true,
+        "failed_orb": true,
+        "gap_and_go": true,
+        "inside_bar": true
+      },
+      "orb_tolerance_percent": 0.05,
+      "breakout_retest_tolerance_percent": 0.15,
+      "vwap_pullback_tolerance_percent": 0.2,
+      "ema20_pullback_tolerance_percent": 0.2,
+      "min_gap_percent": 1.0
+    },
+    "benchmark_symbol": "^NSEI",
+    "_review_flags": "All experimental review-doc flags default OFF to preserve the verified green suite. Enable individually to activate.",
+    "decision_log": true,
+    "allow_rs_exception": false,
+    "use_structural_rr": false,
+    "risk_guardrails": true,
+    "swing_tolerance_percent": 0.1
+  },
+  "stocks": [
+    {
+      "symbol": "BANKBARODA"
+    },
+    {
+      "symbol": "ICICIBANK"
+    },
+    {
+      "symbol": "AXISBANK"
+    },
+    {
+      "symbol": "VEDL"
+    },
+    {
+      "symbol": "KOTAKBANK"
+    },
+    {
+      "symbol": "DLF"
+    },
+    {
+      "symbol": "VBL"
+    },
+    {
+      "symbol": "PNB"
+    },
+    {
+      "symbol": "ULTRACEMCO"
+    },
+    {
+      "symbol": "DRREDDY"
+    },
+    {
+      "symbol": "HDFCLIFE"
+    },
+    {
+      "symbol": "SBILIFE"
+    },
+    {
+      "symbol": "DIVISLAB"
+    },
+    {
+      "symbol": "ITC"
+    },
+    {
+      "symbol": "ADANIPORTS"
+    }
+  ]
+}

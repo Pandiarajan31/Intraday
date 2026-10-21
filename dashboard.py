@@ -1,0 +1,1591 @@
+#!/usr/bin/env python3
+"""
+Intraday Trading Dashboard V2 - Clean Rebuild
+==============================================
+Fresh UI with all data intact, no analysis logic changes.
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+import threading
+import time
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from urllib.parse import parse_qs, urlparse
+import html as html_lib
+
+from shared import DataProvider, Indicators, evaluate_intraday_stock
+from engine import scan_universe, top_opportunities, detect_market_regime, evaluate_stock
+from premarket import run_premarket_scan, compute_opening_range, detect_failed_opening_breakout
+import positions as positions_module
+
+DEFAULT_CONFIG = "intraday_config.json"
+DEFAULT_PORT = 8080
+def compute_and_cache(scan_state, config_path):
+    """Evaluate all stocks and cache results. Must be called with explicit scan_state."""
+    try:
+        scan_state["computing"] = True
+        with open(config_path) as f:
+            cfg = json.load(f)
+        settings = cfg.get("settings", {})
+        stocks = cfg.get("stocks", [])
+        regime = detect_market_regime(settings) if hasattr(detect_market_regime, '__call__') else {"regime": "UNKNOWN"}
+        results = []
+        # Limit concurrent evaluate_stock calls so Angel One rate limiter (5 req/sec)
+        # is never overwhelmed. Each stock may need 3 intervals, so we cap at 2 threads.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        def _eval_limited(stock):
+            return evaluate_stock(stock, settings, regime)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_to_stock = {executor.submit(_eval_limited, stock): stock for stock in stocks}
+            for future in as_completed(future_to_stock):
+                results.append(future.result())
+        # Re-sort results to match original stocks order for funnel computation
+        stock_index = {stock.get("symbol", "?"): i for i, stock in enumerate(stocks)}
+        results = sorted(results, key=lambda r: stock_index.get(r.get("symbol", "?"), 999))
+        # Compute the scan-wide rejection funnel (reuses the per-stock records).
+        # Mirrors engine.scan_universe's own funnel, reading PASS/FAIL from the
+        # buy_conditions / sell_conditions dicts so the bars reflect real gates.
+        try:
+            def _pass(r, key, buy_val=None, sell_val=None):
+                bc = r.get("buy_conditions", {}) or {}
+                sc = r.get("sell_conditions", {}) or {}
+                if buy_val is not None:
+                    return bc.get(key) == buy_val or sc.get(sell_val or key) == buy_val
+                return bc.get(key) == "PASS" or sc.get(key) == "PASS"
+
+            funnel = {
+                "total_scanned": len(results),
+                "data_quality_pass": sum(1 for r in results if r.get("signal") != "ERROR"),
+                "liquidity_pass": sum(1 for r in results if _pass(r, "liquidity")),
+                "session_pass": sum(1 for r in results if _pass(r, "session")),
+                "trend_alignment_pass": sum(
+                    1 for r in results
+                    if (_pass(r, "daily_trend") and _pass(r, "15m_trend") and _pass(r, "5m_structure"))),
+                "vwap_pass": sum(1 for r in results if _pass(r, "vwap")),
+                "volume_pass": sum(1 for r in results if _pass(r, "volume")),
+                "breakout_pass": sum(1 for r in results if _pass(r, "breakout", "PASS", "breakdown")),
+                "rr_pass": sum(1 for r in results if (r.get("risk_reward") or 0) >= 2.0),
+                "score_65plus_pass": sum(
+                    1 for r in results if max(r.get("buy_score", 0), r.get("sell_score", 0)) >= 65),
+                "immediate_signals": sum(1 for r in results if r.get("signal") in ("IMMEDIATE_BUY", "IMMEDIATE_SELL")),
+                "watch_signals": sum(1 for r in results if r.get("signal") in ("BUY_WATCH", "SELL_WATCH")),
+                "almost_signals": sum(1 for r in results if r.get("signal") in ("ALMOST_BUY", "ALMOST_SELL")),
+                "pattern_triggered": sum(1 for r in results if r.get("pattern_triggered_buy") or r.get("pattern_triggered_sell")),
+                "confirmed_buy_patterns": sum(len(r.get("confirmed_buy_patterns", []) or []) for r in results),
+                "confirmed_sell_patterns": sum(len(r.get("confirmed_sell_patterns", []) or []) for r in results),
+                "conflicts": sum(1 for r in results if r.get("pattern_conflict")),
+                "entry_candidates": sum(1 for r in results if (r.get("entry_decision") or {}).get("state") in ("CANDIDATE", "STRONG_CANDIDATE", "READY")),
+                "strong_candidates": sum(1 for r in results if (r.get("entry_decision") or {}).get("state") == "STRONG_CANDIDATE"),
+                "blocker_counts": {},
+            }
+            total = funnel["total_scanned"] or 1
+            funnel["funnel_efficiency_percent"] = round(funnel["immediate_signals"] / total * 100, 2)
+            for r in results:
+                pb = r.get("primary_blocker")
+                if pb:
+                    funnel["blocker_counts"][pb] = funnel["blocker_counts"].get(pb, 0) + 1
+        except Exception:
+            funnel = None
+        # Requirement (a): best-available context candidate so the screen is
+        # never blank when nothing clears the gates. Reuses the same records.
+        try:
+            from engine import compute_best_available
+            best_available = compute_best_available(results, settings)
+        except Exception:
+            best_available = None
+        scan_state["results"] = results
+        scan_state["rejection_funnel"] = funnel
+        scan_state["best_available"] = best_available
+        scan_state["scan_time"] = dt.datetime.now()
+    except Exception as e:
+        error_message = str(e) or e.__class__.__name__
+        print(f"Compute error: {error_message}")
+        scan_state["compute_error"] = error_message
+        scan_state["results"] = []
+    finally:
+        scan_state["computing"] = False
+MARKET_OPEN = dt.time(9, 15)
+MARKET_CLOSE = dt.time(15, 30)
+
+def load_config(path):
+    with open(path) as f:
+        return json.load(f)
+
+ZONE_ORDER = ["GOOD", "EARLY", "WAIT", "LATE", "DONT_CHASE", "NO_TRADE"]
+ZONE_STYLE = {
+    "GOOD": ("var(--green)", "Enter now - full size"),
+    "EARLY": ("var(--green)", "Enter half size - add rest if it turns GOOD"),
+    "WAIT": ("var(--amber)", "Not ready - keep watching"),
+    "LATE": ("var(--red)", "Missed it - skip"),
+    "DONT_CHASE": ("var(--red)", "Wait for a pullback"),
+    "NO_TRADE": ("var(--muted)", "Skip"),
+}
+
+
+def _trade_plan_panel(results, settings, now_t):
+    """Consolidated 'what do I do now' panel: market context + every stock
+    grouped by its Entry Zone, with the full plan (entry/stop/targets/qty)
+    for GOOD and EARLY. Reads only engine fields - no recalculation."""
+    def _t(key, default):
+        return dt.datetime.strptime(settings.get(key, default), "%H:%M").time()
+
+    # Market context (taken from the per-stock records)
+    idx = {}
+    day = None
+    for r in results:
+        if r.get("index_name") and r.get("index_direction"):
+            idx.setdefault(r["index_name"], (r["index_direction"], r.get("index_change_pct")))
+        if day is None and r.get("trading_day_status"):
+            day = r["trading_day_status"]
+
+    if now_t < _t("entry_start_time", "09:45"):
+        phase, phase_col = "Opening volatility - no entries yet", "var(--amber)"
+    elif now_t > _t("entry_end_time", "14:30"):
+        phase, phase_col = "No new entries - manage open trades only", "var(--red)"
+    elif _t("lunch_start_time", "12:00") <= now_t < _t("lunch_end_time", "13:30"):
+        phase, phase_col = "Lunch hours - only strong GOOD setups", "var(--amber)"
+    else:
+        phase, phase_col = "Entry window open", "var(--green)"
+
+    dir_col = {"UP": "var(--green)", "DOWN": "var(--red)"}
+    chips = []
+    for name in ("NIFTY", "BANKNIFTY"):
+        if name in idx:
+            d, chg = idx[name]
+            chg_txt = f" {chg:+.2f}%" if chg is not None else ""
+            chips.append(f'<span style="color:{dir_col.get(d, "var(--amber)")};font-weight:700;">{name} {d}{chg_txt}</span>')
+    chips.append(f'<span style="color:{phase_col};font-weight:700;">{phase}</span>')
+    if day:
+        lim_col = "var(--red)" if day.get("blocked") else "var(--muted)"
+        chips.append(f'<span style="color:{lim_col};">Trades {day.get("trades_today", 0)}/{day.get("max_trades", "-")}'
+                     f' · Loss streak {day.get("losing_streak", 0)}'
+                     f' · P&amp;L ₹{day.get("realized_pnl", 0):,.0f}</span>')
+
+    h = ('<div class="sect" style="margin:16px 0;padding:16px;background:var(--card);border:1px solid var(--border);border-radius:8px;">'
+         '<div class="sect-title" style="font-size:13px;">Today\'s Trade Plan</div>'
+         f'<div style="display:flex;gap:16px;flex-wrap:wrap;font-size:12px;margin:6px 0 10px;">{" ".join(chips)}</div>')
+    if day and day.get("blocked"):
+        h += ('<div style="padding:10px;border-radius:6px;background:var(--red-bg);border:1px solid var(--red);color:#fca5a5;font-weight:700;margin-bottom:10px;">'
+              '⛔ STOP TRADING FOR TODAY: ' + "; ".join(day.get("reasons", [])) + '</div>')
+
+    groups = {z: [] for z in ZONE_ORDER}
+    for r in results:
+        ez = r.get("entry_zone")
+        if not ez:
+            groups["NO_TRADE"].append((r, None, r.get("reason") or "No data"))
+            continue
+        groups.get(ez.get("zone"), groups["NO_TRADE"]).append(
+            (r, ez, (ez.get("reasons") or ["-"])[0]))
+
+    cell = 'style="padding:5px 8px;"'
+    for zone in ZONE_ORDER:
+        rows = groups[zone]
+        if not rows:
+            continue
+        col, action = ZONE_STYLE[zone]
+        h += (f'<div style="margin-top:10px;font-weight:800;color:{col};font-size:13px;">'
+              f'{zone.replace("_", " ")} ({len(rows)}) <span style="font-weight:400;color:var(--muted);font-size:11px;">- {action}</span></div>')
+        h += '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:4px;">'
+        if zone in ("GOOD", "EARLY"):
+            h += ('<tr style="color:var(--muted);text-align:left;border-bottom:1px solid var(--border);">'
+                  f'<th {cell}>Stock</th><th {cell}>Side</th><th {cell}>Entry</th><th {cell}>Stop</th>'
+                  f'<th {cell}>T1 (book 50%)</th><th {cell}>T2</th><th {cell}>Qty</th><th {cell}>RR after charges</th><th {cell}>Why</th></tr>')
+            for r, ez, why in rows:
+                side = r.get("entry_zone_direction", "")
+                side_col = "var(--green)" if side == "BUY" else "var(--red)"
+                h += (f'<tr style="border-bottom:1px solid var(--border);">'
+                      f'<td {cell}><b>{r.get("symbol")}</b></td>'
+                      f'<td {cell}><b style="color:{side_col}">{side}</b></td>'
+                      f'<td {cell}>₹{ez["entry"]:,.2f}</td>'
+                      f'<td {cell} class="value-red">₹{ez["stop_loss"]:,.2f}</td>'
+                      f'<td {cell} class="value-green">₹{ez["t1"]:,.2f}</td>'
+                      f'<td {cell} class="value-green">₹{ez["t2"]:,.2f}</td>'
+                      f'<td {cell}>{ez.get("quantity", "-")} ({ez.get("size", "").lower()})</td>'
+                      f'<td {cell}>{ez.get("net_rr_t2", "-")}</td>'
+                      f'<td style="padding:5px 8px;color:var(--muted);">{why}</td></tr>')
+        else:
+            for r, ez, why in rows:
+                side = r.get("entry_zone_direction", "") if ez else ""
+                h += (f'<tr style="border-bottom:1px solid var(--border);">'
+                      f'<td {cell} width="120"><b>{r.get("symbol")}</b></td>'
+                      f'<td {cell} width="50">{side}</td>'
+                      f'<td style="padding:5px 8px;color:var(--muted);">{why}</td></tr>')
+        h += '</table>'
+    h += ('<div style="font-size:11px;color:var(--muted);margin-top:10px;">At T1: book 50% and move stop to entry. '
+          'Then the tracker trails your stop. Exit if no progress in 30 min. Close everything by square-off.</div>')
+    h += '</div>'
+    return h
+
+
+def generate_html_v2(results, scan_time, market_open, market_close, watchlist_ranked=None, rejection_funnel=None, best_available=None, debug=False, settings=None):
+    """Clean HTML generation with proper structure."""
+    _settings = settings or {}
+    now = dt.datetime.now()
+    now_t = now.time()
+    in_market = market_open <= now_t <= market_close
+    _watchlist_size = _settings.get("watchlist_size", 30)
+    _market_css = 'market-open' if in_market else 'market-closed'
+    _market_text = 'MARKET OPEN' if in_market else 'MARKET CLOSED'
+
+    # Summary stats
+    # FIX 6: Include WATCH signals in candidate counts
+    buy_candidates = [r for r in results if r.get("buy_hard_gate") or r.get("signal") in ("IMMEDIATE_BUY", "ALMOST_BUY", "BUY_NOW", "BUY_WATCH")]
+    sell_candidates = [r for r in results if r.get("sell_hard_gate") or r.get("signal") in ("IMMEDIATE_SELL", "ALMOST_SELL", "SELL_NOW", "SELL_WATCH")]
+    immediate_buys = [r for r in results if r.get("signal") == "IMMEDIATE_BUY"]
+    immediate_sells = [r for r in results if r.get("signal") == "IMMEDIATE_SELL"]
+    errors = [r for r in results if r.get("signal") == "ERROR"]
+
+    # Sort by priority
+    def sort_key(r):
+        gate = 2 if (r.get("buy_hard_gate") or r.get("sell_hard_gate")) else 1
+        score = max(r.get("buy_score", 0), r.get("sell_score", 0))
+        return (gate * 1000 + score)
+
+    results_sorted = sorted(results, key=sort_key, reverse=True)
+
+    # Build HTML using string concatenation to avoid f-string parsing issues
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Intraday Trading Dashboard V2</title>
+<style>
+:root {
+  --bg:#0f172a; --card:#1e293b; --card2:#172033; --border:#334155; --text:#e2e8f0; 
+  --muted:#94a3b8; --green:#22c55e; --green-bg:#052e16; --red:#ef4444; --red-bg:#450a0a; 
+  --amber:#f59e0b; --amber-bg:#451a03; --blue:#3b82f6; --blue-bg:#172554; 
+  --gray:#64748b; --gray-bg:#1e293b;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 20px; min-height: 100vh; }
+
+/* Header */
+.header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
+.header h1 { font-size: 24px; display: flex; align-items: center; gap: 8px; }
+.header .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+.meta { color: var(--muted); font-size: 12px; }
+.toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.toolbar button { background: var(--blue); color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px; }
+.toolbar button:hover { opacity: 0.9; }
+.market-status { padding: 4px 10px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.market-open { background: var(--green-bg); color: var(--green); }
+.market-closed { background: var(--red-bg); color: var(--red); }
+.timer { color: var(--muted); font-size: 11px; }
+
+/* Summary strip */
+.summary { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.summary-item { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; text-align: center; min-width: 100px; }
+.summary-item .num { font-size: 20px; font-weight: 800; }
+.summary-item .lbl { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+.summary-buy .num { color: var(--green); }
+.summary-sell .num { color: var(--red); }
+
+/* Rejection funnel (scan-wide aggregate) */
+.funnels { margin-top: 8px; }
+.funnel-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 11px; }
+.funnel-label { width: 110px; color: var(--muted); }
+.funnel-bar { flex: 1; height: 12px; background: var(--card2); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.funnel-fill { height: 100%; background: linear-gradient(90deg, var(--red), var(--orange, #f59e0b)); }
+.funnel-num { width: 56px; text-align: right; color: var(--fg); font-weight: 700; }
+.funnel-eff { font-size: 12px; margin-top: 6px; color: var(--muted); }
+
+/* Cards Grid */
+.cards-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); gap: 16px; }
+.stock-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,.3); }
+
+/* Card Header */
+.card-hdr { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.card-title { font-size: 16px; font-weight: 700; }
+.card-symbol { color: var(--muted); font-size: 11px; }
+.signal-badge { padding: 6px 14px; border-radius: 16px; font-weight: 800; font-size: 12px; text-transform: uppercase; }
+.sig-IMMEDIATE_BUY { background: var(--green); color: #000; }
+.sig-IMMEDIATE_SELL { background: var(--red); color: #fff; }
+.sig-BUY_NOW { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
+.sig-SELL_NOW { background: var(--red-bg); color: var(--red); border: 1px solid var(--red); }
+.sig-ALMOST_BUY, .sig-ALMOST_SELL { background: var(--amber-bg); color: var(--amber); border: 1px solid var(--amber); }
+.sig-WAIT { background: var(--gray-bg); color: var(--gray); border: 1px solid var(--gray); }
+.sig-CANCEL, .sig-ERROR { background: var(--red-bg); color: var(--red); border: 1px solid var(--red); }
+/* FIX 7: WATCH signal styling - distinct from ALMOST and IMMEDIATE */
+.sig-BUY_WATCH { background: #065f46; color: #6ee7b7; border: 1px solid #065f46; font-weight: 700; }
+.sig-SELL_WATCH { background: #7f1d1d; color: #fca5a5; border: 1px solid #7f1d1d; font-weight: 700; }
+/* Reason */
+.reason { font-size: 12px; color: var(--muted); margin: 4px 0 8px; padding: 6px 8px; background: var(--card2); border-left: 3px solid var(--blue); border-radius: 4px; }
+
+/* Section */
+.sect { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+.sect-title { font-size: 10px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); margin-bottom: 4px; font-weight: 600; }
+.kv { display: flex; justify-content: space-between; font-size: 12px; padding: 2px 0; }
+.kv .label { color: var(--muted); }
+.kv .value { font-weight: 600; }
+.value-green { color: var(--green); }
+.value-red { color: var(--red); }
+.value-amber { color: var(--amber); }
+
+/* Chips */
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.chip { padding: 3px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; }
+.chip-good { background: var(--green-bg); color: var(--green); }
+.chip-bad { background: var(--red-bg); color: var(--red); }
+.chip-warn { background: var(--amber-bg); color: var(--amber); }
+
+/* Badge */
+.badge { padding: 3px 8px; border-radius: 10px; font-size: 10px; font-weight: 700; }
+.badge-good { background: var(--green-bg); color: var(--green); }
+.badge-warn { background: var(--amber-bg); color: var(--amber); }
+.badge-bad { background: var(--red-bg); color: var(--red); }
+
+/* Gate Block */
+.gate-block { margin-top: 6px; padding: 6px 8px; border-radius: 8px; background: var(--card2); border: 1px solid var(--border); }
+.gate-hdr { display: flex; justify-content: space-between; align-items: center; }
+.gate-label { font-size: 12px; font-weight: 700; }
+.gate-list { margin-top: 4px; display: grid; grid-template-columns: 1fr 1fr; gap: 2px 8px; }
+.gate-item { display: flex; justify-content: space-between; font-size: 10px; }
+.gate-item .name { color: var(--muted); }
+.gi-pass { color: var(--green); font-weight: 700; }
+.gi-fail { color: var(--red); font-weight: 700; }
+.gi-unknown { color: var(--gray); font-weight: 700; }
+
+/* Score Progress Bars */
+.score-bars { margin-top: 6px; }
+.score-bar-item { margin-bottom: 8px; }
+.score-bar-label { display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 3px; }
+.score-bar-label .name { color: var(--muted); font-weight: 600; }
+.score-bar-label .val { font-weight: 700; }
+.progress-bar { height: 18px; background: var(--card2); border-radius: 10px; overflow: hidden; border: 1px solid var(--border); }
+.progress-fill { height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; transition: width 0.3s; }
+.progress-fill.buy { background: linear-gradient(90deg, var(--green-bg), var(--green)); color: var(--green); }
+.progress-fill.sell { background: linear-gradient(90deg, var(--red-bg), var(--red)); color: var(--red); }
+.progress-fill.low { opacity: 0.6; }
+.progress-fill.mid { opacity: 0.8; }
+.progress-fill.high { opacity: 1; }
+
+/* Collapsible */
+.collapsible { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+.collapsible summary { cursor: pointer; font-size: 10px; text-transform: uppercase; color: var(--muted); list-style: none; }
+.collapsible summary::before { content: "▸ "; }
+.collapsible[open] summary::before { content: "▾ "; }
+
+/* Error */
+.error-box { background: var(--red-bg); border: 1px solid var(--red); border-radius: 6px; padding: 8px; font-size: 11px; color: #fca5a5; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1><span class="dot"></span> Intraday Dashboard V2</h1>
+    <div class="meta">Scan: """ + scan_time.strftime('%Y-%m-%d %H:%M:%S') + """ | Stocks: """ + str(len(results)) + """</div>
+  </div>
+  <div class="toolbar">
+    <span class="market-status """ + _market_css + """">""" + _market_text + """</span>
+    <button onclick="location.reload()">Refresh</button>
+    <button onclick="runScan()">🔄 Scan</button>
+    <button onclick="runBacktest()" title="Download history + compare strict vs looser settings and recommend the best. Takes several minutes.">📊 Run Backtest</button>
+    <span class="timer" id="timer">Auto: 60s</span>
+  </div>
+</div>
+<div id="backtest-panel" style="display:none;margin:10px 0;padding:12px;border:1px solid #ddd;border-radius:8px;background:#fafafa">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <b>📊 Backtest &amp; Tuning (how many trades + is it profitable?)</b>
+    <button onclick="document.getElementById('backtest-panel').style.display='none'" style="background:#999">Hide</button>
+  </div>
+  <div id="backtest-status" style="font-size:12px;color:#666;margin:6px 0"></div>
+  <pre id="backtest-output" style="white-space:pre-wrap;font-size:12px;max-height:460px;overflow:auto;background:#111;color:#ddd;padding:10px;border-radius:6px;display:none"></pre>
+</div>
+
+<div class="summary">
+  <div class="summary-item"><div class="num">""" + str(len(results)) + """</div><div class="lbl">Total</div></div>
+  <div class="summary-item summary-buy"><div class="num">""" + str(len(buy_candidates)) + """</div><div class="lbl">Buy</div></div>
+  <div class="summary-item summary-sell"><div class="num">""" + str(len(sell_candidates)) + """</div><div class="lbl">Sell</div></div>
+  <div class="summary-item summary-buy"><div class="num">""" + str(len(immediate_buys)) + """</div><div class="lbl">Imm Buy</div></div>
+  <div class="summary-item summary-sell"><div class="num">""" + str(len(immediate_sells)) + """</div><div class="lbl">Imm Sell</div></div>
+  <div class="summary-item"><div class="num">""" + str(len(errors)) + """</div><div class="lbl">Errors</div></div>
+</div>
+
+<div class="sect" id="positions-panel" style="margin:16px 0;padding:16px;background:var(--card);border:1px solid var(--border);border-radius:8px;">
+  <div class="sect-title" style="display:flex;justify-content:space-between;align-items:center;">
+    <span>My Positions</span>
+    <span id="pos-alert-badge" style="display:none;background:var(--red,#e5484d);color:#fff;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:700;">⚠ EXIT ALERT</span>
+  </div>
+
+  <div id="pos-alert-banner" style="display:none;margin:10px 0;padding:12px;border-radius:8px;background:#3a1414;border:1px solid var(--red,#e5484d);color:#ffb4b4;font-size:13px;"></div>
+
+  <details style="margin-top:8px;">
+    <summary style="cursor:pointer;color:var(--muted);font-size:13px;">+ Log a new position</summary>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:flex-end;">
+      <div>
+        <label style="display:block;font-size:11px;color:var(--muted);">Stock</label>
+        <input list="pos-symbol-list" id="pos-symbol" placeholder="e.g. RELIANCE" style="padding:6px;border-radius:6px;border:1px solid var(--border);background:var(--card2);color:inherit;width:140px;">
+        <datalist id="pos-symbol-list">""" + "".join(f'<option value="{s.get("symbol","")}">' for s in (results or [])) + """</datalist>
+      </div>
+      <div>
+        <label style="display:block;font-size:11px;color:var(--muted);">Direction</label>
+        <select id="pos-direction" style="padding:6px;border-radius:6px;border:1px solid var(--border);background:var(--card2);color:inherit;">
+          <option value="BUY">BUY</option>
+          <option value="SELL">SELL</option>
+        </select>
+      </div>
+      <div>
+        <label style="display:block;font-size:11px;color:var(--muted);">Entry price</label>
+        <input type="number" step="0.05" id="pos-entry" placeholder="e.g. 1502.50" style="padding:6px;border-radius:6px;border:1px solid var(--border);background:var(--card2);color:inherit;width:110px;">
+      </div>
+      <div>
+        <label style="display:block;font-size:11px;color:var(--muted);">or range: low</label>
+        <input type="number" step="0.05" id="pos-entry-low" style="padding:6px;border-radius:6px;border:1px solid var(--border);background:var(--card2);color:inherit;width:90px;">
+      </div>
+      <div>
+        <label style="display:block;font-size:11px;color:var(--muted);">high</label>
+        <input type="number" step="0.05" id="pos-entry-high" style="padding:6px;border-radius:6px;border:1px solid var(--border);background:var(--card2);color:inherit;width:90px;">
+      </div>
+      <div>
+        <label style="display:block;font-size:11px;color:var(--muted);">Qty (optional)</label>
+        <input type="number" id="pos-qty" style="padding:6px;border-radius:6px;border:1px solid var(--border);background:var(--card2);color:inherit;width:80px;">
+      </div>
+      <div>
+        <label style="display:block;font-size:11px;color:var(--muted);">or Amount invested</label>
+        <input type="number" id="pos-amount" placeholder="e.g. 50000" style="padding:6px;border-radius:6px;border:1px solid var(--border);background:var(--card2);color:inherit;width:110px;">
+      </div>
+      <div>
+        <label style="display:block;font-size:11px;color:var(--muted);">or Account size</label>
+        <input type="number" id="pos-account-size" placeholder="e.g. 100000" style="padding:6px;border-radius:6px;border:1px solid var(--border);background:var(--card2);color:inherit;width:110px;">
+      </div>
+      <div>
+        <label style="display:block;font-size:11px;color:var(--muted);">+ Risk % per trade</label>
+        <input type="number" step="0.1" id="pos-risk-percent" placeholder="e.g. 1.0" style="padding:6px;border-radius:6px;border:1px solid var(--border);background:var(--card2);color:inherit;width:90px;">
+      </div>
+      <div>
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--muted);">
+          <input type="checkbox" id="pos-notify" checked style="width:14px;height:14px;"> Notify me
+        </label>
+      </div>
+      <button onclick="openPosition()" style="padding:7px 14px;">+ Add Position</button>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:4px;">Sizing priority if more than one is filled: Qty &gt; Amount invested &gt; Account size+Risk %.</div>
+    <div id="pos-form-msg" style="font-size:12px;margin-top:6px;"></div>
+  </details>
+
+  <table id="pos-table" style="width:100%;border-collapse:collapse;margin-top:12px;font-size:12px;display:none;">
+    <thead>
+      <tr style="text-align:left;color:var(--muted);border-bottom:1px solid var(--border);">
+        <th style="padding:6px;">Symbol</th><th style="padding:6px;">Dir</th><th style="padding:6px;">Entry</th>
+        <th style="padding:6px;">Last</th><th style="padding:6px;">P&amp;L</th><th style="padding:6px;">Stop</th>
+        <th style="padding:6px;">T1</th><th style="padding:6px;">T2</th><th style="padding:6px;">T3</th>
+        <th style="padding:6px;">Outlook</th><th style="padding:6px;">Alert</th><th style="padding:6px;"></th>
+      </tr>
+    </thead>
+    <tbody id="pos-tbody"></tbody>
+  </table>
+  <div id="pos-empty" style="color:var(--muted);font-size:12px;margin-top:8px;">No open positions logged yet.</div>
+</div>
+"""
+
+    html = html.replace('<div class="sect" id="positions-panel"',
+                        _trade_plan_panel(results, _settings, now_t) + '<div class="sect" id="positions-panel"', 1)
+
+    # Best-available context panel (requirement a): only shown when there is no
+    # IMMEDIATE signal, so the user always has something to look at. Clearly
+    # labeled context-only - NOT a trade signal.
+    if best_available and best_available.get("active"):
+        def _ba_card(entry, direction):
+            if not entry:
+                return ""
+            sym = entry.get("symbol", "?")
+            score = entry.get("best_available_score", 0)
+            blocker = entry.get("best_available_blocker", "")
+            px = entry.get("price")
+            px_txt = f" @ {px}" if px else ""
+            color = "var(--green)" if direction == "BUY" else "var(--red)"
+            return (
+                f'<div class="ba-card" style="border-left:3px solid {color};padding:6px 10px;margin:4px 0">'
+                f'<b style="color:{color}">BEST {direction}</b>: {sym}{px_txt} '
+                f'<span style="opacity:.8">(score {score})</span><br>'
+                f'<span style="font-size:12px;opacity:.75">Blocked by: {blocker}</span></div>'
+            )
+        ba_cards = _ba_card(best_available.get("buy"), "BUY") + _ba_card(best_available.get("sell"), "SELL")
+        if ba_cards:
+            html = html.replace(
+                '<div class="sect" id="positions-panel"',
+                '<div class="sect"><h2>Best Available — context only, NOT a trade signal</h2>'
+                '<div style="font-size:12px;opacity:.7;margin-bottom:6px">No full-quality signal right now. '
+                'These are the closest candidates so you are never left blank — decide for yourself.</div>'
+                + ba_cards + '</div><div class="sect" id="positions-panel"', 1)
+
+    if rejection_funnel:
+        total = rejection_funnel.get("total_scanned", 0) or 1
+        eff = rejection_funnel.get("funnel_efficiency_percent", 0)
+        funnel_rows = [
+            ("Data quality", rejection_funnel.get("data_quality_pass", 0)),
+            ("Liquidity", rejection_funnel.get("liquidity_pass", 0)),
+            ("Session", rejection_funnel.get("session_pass", 0)),
+            ("Trend alignment", rejection_funnel.get("trend_alignment_pass", 0)),
+            ("VWAP", rejection_funnel.get("vwap_pass", 0)),
+            ("Volume", rejection_funnel.get("volume_pass", 0)),
+            ("Breakout / pattern", rejection_funnel.get("breakout_pass", 0)),
+            ("RR >= 2.0", rejection_funnel.get("rr_pass", 0)),
+            ("Score >= 65", rejection_funnel.get("score_65plus_pass", 0)),
+        ]
+        funnel_html = '<details class="collapsible" open><summary>Scan Diagnostic Funnel</summary><div class="funnels">'
+        for label, passed in funnel_rows:
+            pct = round(passed / total * 100, 1) if total else 0
+            funnel_html += (
+                '<div class="funnel-row"><span class="funnel-label">' + str(label) +
+                '</span><div class="funnel-bar"><div class="funnel-fill" style="width:' + str(pct) +
+                '%"></div></div><span class="funnel-num">' + str(passed) + '/' + str(total) +
+                '</span></div>'
+            )
+        funnel_html += (
+            '<div class="funnel-eff">Funnel efficiency (IMMEDIATE/total): <b style="color:var(--green)">' +
+            str(eff) + '%</b></div>' +
+            '<div class="funnel-eff">Watch: ' + str(rejection_funnel.get("watch_signals", 0)) +
+            ' | Almost: ' + str(rejection_funnel.get("almost_signals", 0)) +
+            ' | Immediate: ' + str(rejection_funnel.get("immediate_signals", 0)) +
+            ' | Pattern triggered: ' + str(rejection_funnel.get("pattern_triggered", 0)) +
+            ' | Conflicts: ' + str(rejection_funnel.get("conflicts", 0)) +
+            ' | Candidates: ' + str(rejection_funnel.get("entry_candidates", 0)) +
+            ' | Strong: ' + str(rejection_funnel.get("strong_candidates", 0)) + '</div>' +
+            '</div></details>'
+        )
+        html += funnel_html
+
+    # Pattern Scanner Matrix table
+    pattern_rows = []
+    for r in results_sorted:
+        sym = r.get("symbol", "?")
+        rep = r.get("pattern_report", {})
+        active_p = rep.get("active_patterns", []) if rep else []
+        for p in active_p:
+            pattern_rows.append((sym, p))
+
+    if pattern_rows:
+        matrix_html = '<details class="collapsible" open style="margin-bottom:16px;"><summary style="font-weight:700;font-size:14px;cursor:pointer;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--text);">🎯 Pattern Scanner Matrix (' + str(len(pattern_rows)) + ' active patterns)</summary>'
+        matrix_html += '<table style="width:100%;border-collapse:collapse;margin-top:8px;font-size:12px;background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden;"><thead><tr style="background:var(--card2);text-align:left;color:var(--muted);border-bottom:1px solid var(--border);">'
+        matrix_html += '<th style="padding:8px;">Symbol</th><th style="padding:8px;">Pattern</th><th style="padding:8px;">Direction</th><th style="padding:8px;">Status</th><th style="padding:8px;">Confidence</th><th style="padding:8px;">Trigger Price</th><th style="padding:8px;">Dist %</th><th style="padding:8px;">Invalidation</th></tr></thead><tbody>'
+        for sym, p in pattern_rows:
+            p_dir = p.get("direction", "BUY")
+            dir_cls = "color:var(--green);font-weight:700;" if p_dir == "BUY" else "color:var(--red);font-weight:700;"
+            p_stat = p.get("status", "WATCHING")
+            stat_cls = "color:var(--green);font-weight:700;" if p_stat == "CONFIRMED" else ("color:var(--amber);" if p_stat == "APPROACHING" else "color:var(--muted);")
+            trig_pr = f"₹{p['trigger_price']:,.2f}" if p.get("trigger_price") else "-"
+            dist_pct = f"{p['distance_to_trigger_percent']:.2f}%" if p.get("distance_to_trigger_percent") is not None else "-"
+            matrix_html += f'<tr style="border-bottom:1px solid var(--border);"><td style="padding:8px;font-weight:700;">{sym}</td><td style="padding:8px;">{p.get("pattern_name", "-")}</td><td style="padding:8px;{dir_cls}">{p_dir}</td><td style="padding:8px;{stat_cls}">{p_stat}</td><td style="padding:8px;">{p.get("confidence", 0)}%</td><td style="padding:8px;">{trig_pr}</td><td style="padding:8px;">{dist_pct}</td><td style="padding:8px;color:var(--muted);font-size:11px;">{p.get("invalidation", "-")}</td></tr>'
+        matrix_html += '</tbody></table></details>'
+        html += matrix_html
+
+    _js_watchlist_size = str(_watchlist_size)
+    html += """
+<div class="cards-grid">
+"""
+
+    for r in results_sorted:
+        signal = r.get("signal", "WAIT")
+        symbol = r.get("symbol", "?")
+        name = r.get("name", symbol)
+        price = r.get("price")
+        buy_score = r.get("buy_score", 0)
+        sell_score = r.get("sell_score", 0)
+        buy_gate = r.get("buy_hard_gate", False)
+        sell_gate = r.get("sell_hard_gate", False)
+        reason = r.get("reason", "") or "N/A"
+        entry = r.get("entry")
+        stop_loss = r.get("stop_loss")
+        targets = [t for t in [r.get("target_1"), r.get("target_2"), r.get("target_3")] if t]
+        rr = r.get("risk_reward")
+        daily_trend = r.get("daily_trend")
+        m15_trend = r.get("m15_trend")
+        m5_structure = r.get("m5_structure")
+        vwap = r.get("vwap")
+        rsi = r.get("rsi")
+        rvol = r.get("rvol")
+        atr_5m = r.get("atr_5m")
+        liquidity = r.get("liquidity_status")
+        event_risk = r.get("event_risk")
+        session_status = r.get("session_status")
+        buy_conditions = r.get("buy_conditions", {})
+        sell_conditions = r.get("sell_conditions", {})
+        breakout = r.get("breakout", False)
+        breakdown = r.get("breakdown", False)
+        primary_blocker = r.get("primary_blocker")
+        secondary_blockers = r.get("secondary_blockers") or []
+        trigger_level = r.get("trigger_level")
+        distance_to_trigger = r.get("distance_to_trigger")
+        closed_market = (session_status == "MARKET_CLOSED")
+        entry_decision = r.get("entry_decision") or {}
+        ed_state = entry_decision.get("state")
+        confluence_buy = r.get("confluence_buy", 0)
+        confluence_sell = r.get("confluence_sell", 0)
+
+        sig_cls = {
+            "IMMEDIATE_BUY": "sig-IMMEDIATE_BUY",
+            "IMMEDIATE_SELL": "sig-IMMEDIATE_SELL",
+            "BUY_NOW": "sig-BUY_NOW",
+            "SELL_NOW": "sig-SELL_NOW",
+            "ALMOST_BUY": "sig-ALMOST_BUY",
+            "ALMOST_SELL": "sig-ALMOST_SELL",
+            "BUY_WATCH": "sig-BUY_WATCH",     # FIX 7: Strong setup ready for breakout
+            "SELL_WATCH": "sig-SELL_WATCH",   # FIX 7: Strong setup ready for breakdown
+            "WAIT": "sig-WAIT",
+            "CANCEL": "sig-CANCEL",
+            "ERROR": "sig-ERROR",
+        }.get(signal, "sig-WAIT")
+
+        price_str = f"₹{price:,.2f}" if price is not None else "N/A"
+
+        # ERROR card
+        if signal == "ERROR":
+            html += f"""
+<div class="stock-card">
+  <div class="card-hdr">
+    <div><div class="card-title">{name}</div><div class="card-symbol">{symbol}</div></div>
+    <span class="signal-badge {sig_cls}">{signal}</span>
+  </div>
+  <div class="error-box">⚠️ {reason}</div>
+</div>
+"""
+            continue
+
+        # Normal card - open tag
+        html += f"""
+<div class="stock-card">
+  <div class="card-hdr">
+    <div><div class="card-title">{name}</div><div class="card-symbol">{symbol}</div></div>
+    <span class="signal-badge {sig_cls}">{signal.replace('_', ' ')}</span>
+  </div>
+  <div class="reason">{reason}</div>
+"""
+
+        # ---- Early heads-up (lower confidence) ----
+        # The engine computes an EARLY_REVERSAL signal that fires BEFORE the
+        # confirmed breakout - i.e. "a turn may be forming" near a support
+        # (early BUY) or resistance (early SELL). It is deliberately earlier and
+        # therefore LESS reliable than the IMMEDIATE signals, so it is shown as
+        # a clearly-labeled heads-up, never mixed into the main decision.
+        er_sig = r.get("early_reversal_signal")
+        if er_sig and not closed_market:
+            er_dir = "BUY" if er_sig == "EARLY_REVERSAL_BUY" else "SELL"
+            er_conf = r.get("early_reversal_confidence", 0)
+            er_reasons = r.get("early_reversal_reasons") or []
+            er_color = "var(--green)" if er_dir == "BUY" else "var(--red)"
+            reasons_html = "".join(f"<li>{rr}</li>" for rr in er_reasons[:4])
+            html += (
+                f'<div class="sect" style="border:1px dashed {er_color};border-radius:6px;'
+                f'padding:6px;margin-top:4px;">'
+                f'<div class="sect-title" style="color:{er_color}">'
+                f'⚡ EARLY HEADS-UP: possible {er_dir} turn forming '
+                f'(confidence {er_conf}/100 - LOWER than a confirmed signal)</div>'
+                f'<div style="font-size:11px;color:var(--muted);margin:2px 0">'
+                f'Fires before the breakout confirms, so it is wrong more often. '
+                f'Use it to START WATCHING - wait for the confirmed signal (or enter '
+                f'small with a tight stop), do not treat it as "enter now".</div>'
+                f'<ul style="font-size:11px;margin:4px 0 0 16px;padding:0">{reasons_html}</ul>'
+                f'</div>'
+            )
+
+        # Manual entry zone - one label for entries taken without waiting for IMMEDIATE
+        ez = r.get("entry_zone")
+        if ez and not closed_market:
+            ez_dir = r.get("entry_zone_direction", "")
+            zone = ez.get("zone", "NO_TRADE")
+            ez_color = {
+                "GOOD": "var(--green)", "EARLY": "var(--green)", "WAIT": "var(--amber)",
+                "LATE": "var(--red)", "DONT_CHASE": "var(--red)", "NO_TRADE": "var(--muted)",
+            }.get(zone, "var(--muted)")
+            size = ez.get("size", "NONE")
+            size_txt = {"FULL": "full size", "HALF": "half size"}.get(size, "no entry")
+            html += f'<div class="sect" style="border:1px solid {ez_color};border-radius:6px;padding:6px;">'
+            html += (f'<div class="sect-title" style="color:{ez_color}">Entry Zone: '
+                     f'{ez_dir} {zone.replace("_", " ")} · {size_txt}</div>')
+            nums = []
+            if ez.get("distance_pct") is not None:
+                nums.append(f"{ez['distance_pct']:.2f}% to level")
+            if ez.get("extension_atr") is not None:
+                nums.append(f"{ez['extension_atr']:.2f}x ATR past level")
+            if ez.get("vwap_stretch_atr") is not None:
+                nums.append(f"{ez['vwap_stretch_atr']:.2f}x ATR from VWAP")
+            cur_rr = r.get("current_rr_buy") if ez_dir == "BUY" else r.get("current_rr_sell")
+            if cur_rr is not None:
+                nums.append(f"RR from now {cur_rr:.2f}")
+            if nums:
+                html += f'<div style="font-size:11px;">{" · ".join(nums)}</div>'
+            if zone in ("GOOD", "EARLY") and ez.get("stop_loss"):
+                html += (f'<div style="font-size:12px;margin-top:4px;font-weight:600;">'
+                         f'Entry ₹{ez["entry"]:,.2f} · Stop <span class="value-red">₹{ez["stop_loss"]:,.2f}</span>'
+                         f' · T1 <span class="value-green">₹{ez["t1"]:,.2f}</span>'
+                         f' · T2 <span class="value-green">₹{ez["t2"]:,.2f}</span>'
+                         f' · Qty {ez.get("quantity")}</div>')
+            if ez.get("reasons"):
+                html += f'<div style="font-size:11px;color:var(--muted);margin-top:4px;">{"<br>".join(ez["reasons"])}</div>'
+            html += '</div>'
+
+        # #16 Primary blocker + #14 distance-to-trigger surface (WAIT/ALMOST/WATCH)
+        if not closed_market and (primary_blocker or trigger_level or ed_state):
+            html += '<div class="sect"><div class="sect-title" style="color:var(--amber)">Why Not Enter</div>'
+            if ed_state:
+                html += f'<div class="kv"><span class="label">Entry decision</span><span class="value">{ed_state}</span></div>'
+            if entry_decision.get("blocker_detail"):
+                html += f'<div class="kv"><span class="label">Detail</span><span class="value">{entry_decision.get("blocker_detail")}</span></div>'
+            if primary_blocker:
+                blk = primary_blocker.replace('_', ' ').upper()
+                html += f'<div class="kv"><span class="label">Primary blocker</span><span class="value value-amber">{blk}</span></div>'
+                if secondary_blockers:
+                    sec = ', '.join(s.replace('_', ' ').upper() for s in secondary_blockers)
+                    html += f'<div class="kv"><span class="label">Secondary</span><span class="value">{sec}</span></div>'
+            if trigger_level and distance_to_trigger is not None:
+                html += f'<div class="kv"><span class="label">Trigger</span><span class="value">₹{trigger_level:,.2f} · {distance_to_trigger:.2f}%</span></div>'
+            if confluence_buy or confluence_sell:
+                html += f'<div class="kv"><span class="label">Confluence</span><span class="value">BUY {confluence_buy} / SELL {confluence_sell}</span></div>'
+            html += '</div>'
+
+        # Price / Session
+        html += '<div class="sect"><div class="sect-title">Price</div>'
+        html += f'<div class="kv"><span class="label">Current</span><span class="value" id="livecard-price-{symbol}" data-live-symbol="{symbol}">{price_str}</span></div>'
+        if closed_market:
+            html += '<div class="kv"><span class="label">Market</span><span class="value value-amber">CLOSED</span></div>'
+        html += '</div>'
+
+        if closed_market:
+            html += '<div style="text-align:center;padding:12px;color:var(--muted);font-size:11px;">Market closed — conditions not evaluated</div>'
+            html += '</div>\n'  # Close card
+            continue
+
+        # 5m Trigger
+        html += '<div class="sect"><div class="sect-title">5m Trigger</div><div class="chips">'
+        html += f'<span class="chip {"chip-good" if breakout else "chip-bad"}">{"✓" if breakout else "✗"} Breakout</span>'
+        html += f'<span class="chip {"chip-good" if breakdown else "chip-bad"}">{"✓" if breakdown else "✗"} Breakdown</span>'
+        html += '</div></div>'
+
+        # Trade Levels
+        html += '<div class="sect"><div class="sect-title">Trade Levels</div>'
+        html += f'<div class="kv"><span class="label">Entry</span><span class="value">{"₹" + f"{entry:,.2f}" if entry else "N/A"}</span></div>'
+        html += f'<div class="kv"><span class="label">Stop Loss</span><span class="value value-red">{"₹" + f"{stop_loss:,.2f}" if stop_loss else "N/A"}</span></div>'
+        if targets:
+            tgt_str = ", ".join([f"₹{t:,.2f}" for t in targets])
+            html += f'<div class="kv"><span class="label">Targets</span><span class="value value-green">{tgt_str}</span></div>'
+        if rr is not None:
+            rr_cls = "value-green" if rr >= 2 else "value-amber" if rr >= 1 else "value-red"
+            html += f'<div class="kv"><span class="label">R/R</span><span class="value {rr_cls}">{rr:.2f}</span></div>'
+        html += '</div>'
+
+        # Hard Gates
+        html += '<div class="sect"><div class="sect-title">Hard Gates</div>'
+        
+        # BUY Gate
+        buy_status = "PASS" if buy_gate else "FAIL"
+        buy_cls = "badge-good" if buy_gate else "badge-bad"
+        html += f'<div class="gate-block"><div class="gate-hdr"><span class="gate-label">BUY</span><span class="badge {buy_cls}">{buy_status}</span></div>'
+        if buy_conditions:
+            html += '<div class="gate-list">'
+            for key, val in buy_conditions.items():
+                if val == "PASS":
+                    cls, disp = "gi-pass", "PASS"
+                elif val == "FAIL":
+                    cls, disp = "gi-fail", "FAIL"
+                else:
+                    cls, disp = "gi-unknown", "N/A"
+                html += f'<div class="gate-item"><span class="name">{key.replace("_", " ")}</span><span class="{cls}">{disp}</span></div>'
+            html += '</div>'
+        html += '</div>'
+
+        # SELL Gate
+        sell_status = "PASS" if sell_gate else "FAIL"
+        sell_cls = "badge-good" if sell_gate else "badge-bad"
+        html += f'<div class="gate-block"><div class="gate-hdr"><span class="gate-label">SELL</span><span class="badge {sell_cls}">{sell_status}</span></div>'
+        if sell_conditions:
+            html += '<div class="gate-list">'
+            for key, val in sell_conditions.items():
+                if val == "PASS":
+                    cls, disp = "gi-pass", "PASS"
+                elif val == "FAIL":
+                    cls, disp = "gi-fail", "FAIL"
+                else:
+                    cls, disp = "gi-unknown", "N/A"
+                html += f'<div class="gate-item"><span class="name">{key.replace("_", " ")}</span><span class="{cls}">{disp}</span></div>'
+            html += '</div>'
+        html += '</div>'
+
+        # Score Progress Bars
+        html += '<div class="score-bars">'
+        
+        # BUY score bar
+        buy_pct = min(100, buy_score)
+        buy_cls = "high" if buy_score >= 70 else "mid" if buy_score >= 40 else "low"
+        html += f'''<div class="score-bar-item">
+  <div class="score-bar-label"><span class="name">BUY Score</span><span class="val" style="color:var(--green)">{buy_score}/100</span></div>
+  <div class="progress-bar"><div class="progress-fill buy {buy_cls}" style="width:{buy_pct}%">{buy_score}%</div></div>
+</div>'''
+        
+        # SELL score bar
+        sell_pct = min(100, sell_score)
+        sell_cls = "high" if sell_score >= 70 else "mid" if sell_score >= 40 else "low"
+        html += f'''<div class="score-bar-item">
+  <div class="score-bar-label"><span class="name">SELL Score</span><span class="val" style="color:var(--red)">{sell_score}/100</span></div>
+  <div class="progress-bar"><div class="progress-fill sell {sell_cls}" style="width:{sell_pct}%">{sell_score}%</div></div>
+</div>'''
+
+        html += '</div>'
+
+        # Move status - how stretched the move already is (exhaustion)
+        ex_buy = r.get("exhaustion_buy") or 0
+        ex_sell = r.get("exhaustion_sell") or 0
+        def _move_status(v, exhausted):
+            if exhausted:
+                return "Exhausted", "value-red"
+            if v >= 25:
+                return "Stretched", "value-amber"
+            return "Fresh", "value-green"
+        bs, bcls = _move_status(ex_buy, r.get("exhausted_buy"))
+        ss, scls = _move_status(ex_sell, r.get("exhausted_sell"))
+        html += '<div class="sect"><div class="sect-title">Move Status</div>'
+        html += f'<div class="kv"><span class="label">Up-move</span><span class="value {bcls}">{bs} ({ex_buy})</span></div>'
+        html += f'<div class="kv"><span class="label">Down-move</span><span class="value {scls}">{ss} ({ex_sell})</span></div>'
+        ex_reasons = (r.get("exhaustion_reasons_buy") or []) + (r.get("exhaustion_reasons_sell") or [])
+        if ex_reasons:
+            html += f'<div style="font-size:11px;color:var(--muted);margin-top:4px;">{"<br>".join(ex_reasons)}</div>'
+        html += '</div>'
+
+        # Early reversal warning - separate from BUY/SELL, info only
+        er_sig = r.get("early_reversal_signal")
+        if er_sig:
+            er_dir = "UP" if er_sig == "EARLY_REVERSAL_BUY" else "DOWN"
+            er_conf = r.get("early_reversal_confidence", 0)
+            er_reasons = "<br>".join(r.get("early_reversal_reasons") or [])
+            html += (
+                '<div class="sect" style="border:1px solid var(--amber);border-radius:6px;padding:6px;">'
+                f'<div class="sect-title" style="color:var(--amber)">⚠ Possible turn {er_dir} (confidence {er_conf})</div>'
+                '<div style="font-size:11px;color:var(--muted);">Early, lower confidence - NOT an entry signal</div>'
+                f'<div style="font-size:11px;margin-top:4px;">{er_reasons}</div>'
+                '</div>'
+            )
+        html += '</div>'
+
+        # FIX 6: Surface rejection funnel - show why WAIT/BUY_WATCH/SELL_WATCH
+        failed_conditions = r.get("failed_conditions", [])
+        if failed_conditions or signal == "WAIT":
+            # Show why this signal was rejected
+            rejection_reasons = {
+                "incomplete_5m_candles": "5m candle still forming",
+                "body_ratio_unavailable": "Candle body unavailable",
+                "atr_unavailable": "ATR data unavailable",
+                "body_ratio_low": "Candle body too small",
+            }
+            reasons_list = [rejection_reasons.get(f, f) for f in failed_conditions]
+            if not reasons_list and signal == "WAIT":
+                reasons_list = ["Below score threshold"]
+            
+            if reasons_list:
+                html += '<div class="sect"><div class="sect-title" style="color:var(--red)">Rejection Funnel</div><div class="chips">'
+                for reason in reasons_list:
+                    html += f'<span class="chip chip-bad">✗ {reason}</span>'
+                html += '</div></div>'
+
+        # Trend
+        html += '<div class="sect"><div class="sect-title">Trend</div><div class="chips">'
+        for lbl, val in [("Daily", daily_trend), ("15m", m15_trend), ("5m", m5_structure)]:
+            if val:
+                cls = "badge-good" if val in ("BULLISH", "UP_TREND") else "badge-bad" if val in ("BEARISH", "DOWN_TREND") else "badge-warn"
+                html += f'<span class="badge {cls}">{lbl}: {val}</span>'
+        html += '</div></div>'
+
+        # Technical
+        html += '<div class="sect"><div class="sect-title">Technical</div>'
+        if vwap:
+            vwap_cls = "value-green" if price and price > vwap else "value-red"
+            html += f'<div class="kv"><span class="label">VWAP</span><span class="value {vwap_cls}">₹{vwap:,.2f}</span></div>'
+        if rvol:
+            vol_cls = "value-green" if rvol >= 1.5 else "value-amber" if rvol >= 1.0 else "value-red"
+            html += f'<div class="kv"><span class="label">RVOL</span><span class="value {vol_cls}">{rvol:.2f}x</span></div>'
+        if atr_5m:
+            html += f'<div class="kv"><span class="label">ATR 5m</span><span class="value">₹{atr_5m:.2f}</span></div>'
+        if rsi:
+            rsi_cls = "value-green" if 40 <= rsi <= 70 else "value-amber"
+            html += f'<div class="kv"><span class="label">RSI 5m</span><span class="value {rsi_cls}">{rsi:.1f}</span></div>'
+        html += '</div>'
+
+        # Context
+        html += '<div class="sect"><div class="sect-title">Context</div><div class="chips">'
+        if liquidity:
+            liq_cls = "chip-good" if liquidity == "GOOD" else "chip-bad"
+            html += f'<span class="chip {liq_cls}">Liq: {liquidity}</span>'
+        if event_risk:
+            ev_cls = "chip-good" if event_risk == "LOW" else "chip-bad"
+            html += f'<span class="chip {ev_cls}">Risk: {event_risk}</span>'
+        html += '</div></div>'
+
+        # Patterns
+        primary_p = r.get("primary_pattern")
+        ag_count = r.get("pattern_agreement_count", 0)
+        ag_lvl = r.get("agreement_level", "LOW")
+        if primary_p:
+            p_name = primary_p.get("pattern_name", "None")
+            p_dir = primary_p.get("direction", "BUY")
+            p_stat = primary_p.get("status", "WATCHING")
+            p_conf = primary_p.get("confidence", 0)
+            p_cls = "value-green" if p_stat == "CONFIRMED" else "value-amber"
+            html += '<div class="sect"><div class="sect-title">Pattern Signal</div>'
+            html += f'<div class="kv"><span class="label">Primary</span><span class="value {p_cls}">{p_name} ({p_dir} · {p_conf}%)</span></div>'
+            html += f'<div class="kv"><span class="label">Agreement</span><span class="value">{ag_lvl} ({ag_count} confirmed)</span></div>'
+            html += '</div>'
+
+        # Close card - IMPORTANT
+        html += '</div>\n'
+
+    html += """
+</div>
+<script>
+let countdown = 60;
+function updateTimer() {
+  const el = document.getElementById('timer');
+  if (el) {
+    el.textContent = `Auto: ${countdown}s`;
+    countdown--;
+    if (countdown < 0) {
+      location.reload();
+    }
+  }
+}
+setInterval(updateTimer, 1000);
+
+let _watchlist_size = """ + _js_watchlist_size + """;
+function runScan() {
+  fetch('/api/scan?top=' + _watchlist_size).then(r => r.json()).then(d => {
+    if (d.status === 'started' || d.status === 'running') {
+      pollScan();
+    }
+  });
+}
+function pollScan() {
+  fetch('/api/scan/status').then(r => r.json()).then(s => {
+    if (s.running) {
+      setTimeout(pollScan, 3000);
+    } else {
+      location.reload();
+    }
+  });
+}
+
+// ---- Backtest: download history + compare settings + recommend ----
+function runBacktest() {
+  const panel = document.getElementById('backtest-panel');
+  const status = document.getElementById('backtest-status');
+  const out = document.getElementById('backtest-output');
+  panel.style.display = 'block';
+  out.style.display = 'none';
+  status.textContent = 'Starting... (this downloads months of history and tests several settings - it can take 5-15 minutes). You can keep using the dashboard.';
+  fetch('/api/backtest', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (d.status === 'started' || d.status === 'running') pollBacktest();
+    else status.textContent = 'Could not start: ' + (d.error || 'unknown');
+  }).catch(e => { status.textContent = 'Error: ' + e; });
+}
+function pollBacktest() {
+  fetch('/api/backtest/status').then(r => r.json()).then(s => {
+    const status = document.getElementById('backtest-status');
+    const out = document.getElementById('backtest-output');
+    status.textContent = s.message || (s.running ? 'Running...' : 'Done');
+    if (s.output) { out.style.display = 'block'; out.textContent = s.output; }
+    if (s.running) setTimeout(pollBacktest, 4000);
+  }).catch(e => { setTimeout(pollBacktest, 5000); });
+}
+
+// ---- Positions: manual trade tracking + instant exit alerts ----
+let _seenAlertIds = new Set();
+let _notifyPermissionAsked = false;
+
+function beep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.frequency.value = 880; osc.type = 'sine';
+    gain.gain.setValueAtTime(0.001, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.3, ctx.currentTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
+    osc.start(); osc.stop(ctx.currentTime + 0.55);
+    setTimeout(() => { try {
+      const osc2 = ctx.createOscillator(); const gain2 = ctx.createGain();
+      osc2.connect(gain2); gain2.connect(ctx.destination);
+      osc2.frequency.value = 1046; osc2.type = 'sine';
+      gain2.gain.setValueAtTime(0.001, ctx.currentTime);
+      gain2.gain.exponentialRampToValueAtTime(0.3, ctx.currentTime + 0.02);
+      gain2.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
+      osc2.start(); osc2.stop(ctx.currentTime + 0.55);
+    } catch(e) {} }, 250);
+  } catch (e) { /* audio not available - banner + badge still show */ }
+}
+
+function notifyAlert(p) {
+  if (!_notifyPermissionAsked && "Notification" in window && Notification.permission === "default") {
+    Notification.requestPermission();
+    _notifyPermissionAsked = true;
+  }
+  if ("Notification" in window && Notification.permission === "granted") {
+    new Notification(`${p.symbol}: ${p.alert.replace(/_/g, ' ')}`, { body: p.alert_message || '' });
+  }
+  beep();
+}
+
+function fmtMoney(v) { return (v === null || v === undefined) ? '-' : '₹' + Number(v).toFixed(2); }
+
+function loadPositions() {
+  fetch('/api/positions').then(r => r.json()).then(d => {
+    const positions = d.positions || [];
+    const open = positions.filter(p => p.status === 'OPEN');
+    const tbody = document.getElementById('pos-tbody');
+    const table = document.getElementById('pos-table');
+    const empty = document.getElementById('pos-empty');
+    const badge = document.getElementById('pos-alert-badge');
+    const banner = document.getElementById('pos-alert-banner');
+
+    if (open.length === 0) {
+      table.style.display = 'none'; empty.style.display = 'block';
+      badge.style.display = 'none'; banner.style.display = 'none';
+      return;
+    }
+    empty.style.display = 'none'; table.style.display = 'table';
+
+    let html = '';
+    let activeAlerts = [];
+    for (const p of open) {
+      const pnl = p.unrealized_pnl_percent;
+      const pnlColor = (pnl > 0) ? 'var(--good,#3ecf8e)' : (pnl < 0 ? 'var(--red,#e5484d)' : 'inherit');
+      const pnlAmountStr = (p.unrealized_pnl_amount !== null && p.unrealized_pnl_amount !== undefined) ? ` (${fmtMoney(p.unrealized_pnl_amount)})` : '';
+      const alertCell = p.alert
+        ? `<span style="background:var(--red,#e5484d);color:#fff;padding:2px 6px;border-radius:4px;font-size:11px;">${p.alert.replace(/_/g,' ')}</span>`
+        : '-';
+      let outlookCell = '<span style="color:var(--muted);">-</span>';
+      if (p.outlook) {
+        const v = p.outlook.verdict;
+        const color = v === 'TOWARD_TARGET' ? 'var(--good,#3ecf8e)' : (v === 'TOWARD_STOPLOSS' ? 'var(--red,#e5484d)' : 'var(--muted)');
+        const label = v === 'TOWARD_TARGET' ? '↑ Target' : (v === 'TOWARD_STOPLOSS' ? '↓ Stop' : '→ Neutral');
+        outlookCell = `<span style="color:${color};font-weight:600;" title="${(p.outlook.reasons||[]).join(' | ')}">${label} (${p.outlook.confidence}%)</span>`;
+      }
+      html += `<tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:6px;font-weight:700;">${p.symbol}</td>
+        <td style="padding:6px;">${p.direction}</td>
+        <td style="padding:6px;">${fmtMoney(p.entry_price)}</td>
+        <td style="padding:6px;">${fmtMoney(p.last_price)}</td>
+        <td style="padding:6px;color:${pnlColor};">${pnl === null || pnl === undefined ? '-' : pnl.toFixed(2) + '%'}${pnlAmountStr}</td>
+        <td style="padding:6px;color:var(--red,#e5484d);">${fmtMoney(p.stop_loss)}</td>
+        <td style="padding:6px;">${fmtMoney(p.t1)}</td>
+        <td style="padding:6px;">${fmtMoney(p.t2)}</td>
+        <td style="padding:6px;">${fmtMoney(p.t3)}</td>
+        <td style="padding:6px;">${outlookCell}</td>
+        <td style="padding:6px;">${alertCell}</td>
+        <td style="padding:6px;white-space:nowrap;">
+          ${p.alert ? `<button onclick="ackAlert('${p.id}')" style="font-size:11px;padding:3px 6px;">Ack</button>` : ''}
+          <button onclick="closePos('${p.id}')" style="font-size:11px;padding:3px 6px;">Close</button>
+          <button onclick="removePos('${p.id}')" title="Remove from tracker entirely" style="font-size:11px;padding:3px 6px;">Remove</button>
+        </td>
+      </tr>`;
+      if (p.alert) activeAlerts.push(p);
+    }
+    tbody.innerHTML = html;
+
+    if (activeAlerts.length > 0) {
+      badge.style.display = 'inline-block';
+      banner.style.display = 'block';
+      banner.innerHTML = activeAlerts.map(p =>
+        `<div><b>${p.symbol}</b> (${p.direction}) — ${p.alert.replace(/_/g,' ')}: ${p.alert_message || ''}</div>`
+      ).join('');
+      for (const p of activeAlerts) {
+        const key = p.id + ':' + p.alert_time;
+        if (!_seenAlertIds.has(key)) {
+          _seenAlertIds.add(key);
+          notifyAlert(p);
+        }
+      }
+    } else {
+      badge.style.display = 'none';
+      banner.style.display = 'none';
+    }
+  }).catch(() => {});
+}
+
+function openPosition() {
+  const symbol = document.getElementById('pos-symbol').value.trim();
+  const direction = document.getElementById('pos-direction').value;
+  const entry = document.getElementById('pos-entry').value;
+  const lo = document.getElementById('pos-entry-low').value;
+  const hi = document.getElementById('pos-entry-high').value;
+  const qty = document.getElementById('pos-qty').value;
+  const amount = document.getElementById('pos-amount').value;
+  const accountSize = document.getElementById('pos-account-size').value;
+  const riskPercent = document.getElementById('pos-risk-percent').value;
+  const notify = document.getElementById('pos-notify').checked;
+  const msg = document.getElementById('pos-form-msg');
+
+  if (!symbol) { msg.textContent = 'Enter a stock symbol.'; msg.style.color = 'var(--red,#e5484d)'; return; }
+  if (!entry && !(lo && hi)) { msg.textContent = 'Enter an entry price, or both a low and high range.'; msg.style.color = 'var(--red,#e5484d)'; return; }
+
+  const body = { symbol, direction, notify_enabled: notify };
+  if (entry) body.entry_price = parseFloat(entry);
+  if (lo) body.entry_price_low = parseFloat(lo);
+  if (hi) body.entry_price_high = parseFloat(hi);
+  if (qty) body.quantity = parseFloat(qty);
+  if (amount) body.amount_invested = parseFloat(amount);
+  if (accountSize) body.account_size = parseFloat(accountSize);
+  if (riskPercent) body.risk_percent = parseFloat(riskPercent);
+
+  msg.textContent = 'Computing stop-loss/targets...'; msg.style.color = 'var(--muted)';
+  fetch('/api/positions/open', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) { msg.textContent = d.error; msg.style.color = 'var(--red,#e5484d)'; return; }
+      let sizingNote = '';
+      if (d.sizing_method === 'risk_percent' || d.sizing_method === 'risk_percent_atr_fallback') {
+        sizingNote = ` | Qty ${d.quantity} sized to risk ${fmtMoney(d.risk_amount)}`;
+        if (d.sizing_method === 'risk_percent_atr_fallback') sizingNote += ' (ATR estimate - thin data, treat as rough)';
+      } else if (d.quantity) {
+        sizingNote = ` | Qty ${d.quantity}`;
+      }
+      msg.textContent = `Added ${d.symbol}: SL ${fmtMoney(d.stop_loss)} / T1 ${fmtMoney(d.t1)} / T2 ${fmtMoney(d.t2)} / T3 ${fmtMoney(d.t3)}${sizingNote}`;
+      msg.style.color = 'var(--good,#3ecf8e)';
+      document.getElementById('pos-symbol').value = '';
+      document.getElementById('pos-entry').value = '';
+      document.getElementById('pos-entry-low').value = '';
+      document.getElementById('pos-entry-high').value = '';
+      document.getElementById('pos-qty').value = '';
+      document.getElementById('pos-amount').value = '';
+      document.getElementById('pos-account-size').value = '';
+      document.getElementById('pos-risk-percent').value = '';
+      loadPositions();
+    })
+    .catch(() => { msg.textContent = 'Request failed.'; msg.style.color = 'var(--red,#e5484d)'; });
+}
+
+function closePos(id) {
+  fetch('/api/positions/close', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) })
+    .then(() => loadPositions());
+}
+function ackAlert(id) {
+  fetch('/api/positions/acknowledge', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) })
+    .then(() => loadPositions());
+}
+function removePos(id) {
+  if (!confirm('Remove this position from the tracker completely? This cannot be undone.')) return;
+  fetch('/api/positions/remove', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) })
+    .then(() => loadPositions());
+}
+
+loadPositions();
+setInterval(loadPositions, 10000);  // poll every 10s so alerts surface promptly
+
+// Live prices: updates each card's price in-place from a fast, independent
+// backend loop (~10s cadence) instead of waiting on the much slower full
+// indicator scan + 60s page reload. This is what actually closes the
+// price-staleness gap - the number on screen now reflects a quote that's
+// at most ~10-15s old, regardless of how long the full scan is taking.
+function pollLivePrices() {
+  fetch('/api/live_prices').then(r => r.json()).then(d => {
+    const prices = d.prices || {};
+    for (const [symbol, info] of Object.entries(prices)) {
+      const el = document.getElementById('livecard-price-' + symbol);
+      if (el && info.price !== undefined && info.price !== null) {
+        el.textContent = '₹' + Number(info.price).toFixed(2);
+      }
+    }
+  }).catch(() => {});
+}
+pollLivePrices();
+setInterval(pollLivePrices, 8000);
+</script>
+</body>
+</html>
+"""
+    return html
+
+def run_dashboard(config_path, port):
+    try:
+        _start = load_config(config_path)
+        if not _start.get("stocks"):
+            # Do NOT hard-exit: the dashboard can still run so the user can click
+            # "Scan Universe" (or load a list) to populate stocks. Previously an
+            # empty watchlist aborted the whole app with just "No stocks configured."
+            print("No stocks configured — start the dashboard and click "
+                  "'Scan Universe', or add symbols to intraday_config.json['stocks'].")
+    except Exception as e:
+        print(f"Config load error: {e}")
+        return
+
+    scan_state = {
+        "running": False,
+        "results": [],
+        "scan_time": None,
+        "rejection_funnel": None,
+        "best_available": None,
+        "computing": False,
+        "backtest": {"running": False, "message": "", "output": ""},
+        "compute_error": None,
+        "live_prices": {},   # symbol -> {price, timestamp} - refreshed on a
+                              # fast independent cycle, decoupled from the
+                              # much heavier full indicator scan below
+    }
+
+
+    class Handler(SimpleHTTPRequestHandler):
+        def do_GET(self):
+            # Parse query params for debug flag
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            debug = params.get("debug", ["0"])[0] == "1"
+            
+            settings = load_config(config_path)
+            
+            if parsed.path in ("/", "/index.html"):
+                results = scan_state.get("results", [])
+                scan_time = scan_state.get("scan_time") or dt.datetime.now()
+                compute_error = scan_state.get("compute_error")
+                now = dt.datetime.now()
+                cfg_stocks = load_config(config_path).get("stocks", [])
+
+                # Empty watchlist: show an actionable message instead of looping
+                # on "Loading..." or hard-crashing. The user can click Scan Universe
+                # (which writes stocks) or populate intraday_config.json manually.
+                if not cfg_stocks and not scan_state.get("computing"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(
+                        b"<html><body style='font-family:sans-serif;padding:2rem'>"
+                        b"<h1>No stocks configured</h1>"
+                        b"<p>Your watchlist (<code>intraday_config.json &rarr; stocks</code>) is empty.</p>"
+                        b"<p>Click <b>Scan Universe</b> to auto-build a watchlist from pre-market data, "
+                        b"or add symbols manually to the <code>stocks</code> array.</p>"
+                        b"<button onclick=\"startScan()\">Scan Universe</button>"
+                        b"<script>function startScan(){fetch('/api/scan').then(()=>setTimeout(()=>location.reload(),4000));}"
+                        b"setTimeout(function(){location.reload();}, 8000);</script>"
+                        b"</body></html>"
+                    )
+                    return
+
+                if not results and not scan_state.get("computing") and not compute_error:
+                    scan_state["computing"] = True
+                    threading.Thread(target=compute_and_cache, args=(scan_state, config_path), daemon=True).start()
+                elif results and (now - scan_time).total_seconds() > 60 and not scan_state.get("computing"):
+                    scan_state["computing"] = True
+                    threading.Thread(target=compute_and_cache, args=(scan_state, config_path), daemon=True).start()
+
+                if compute_error and not scan_state.get("computing"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    safe_error = html_lib.escape(compute_error)
+                    body = f"<html><body style='font-family:sans-serif;padding:2rem'><h1>Dashboard scan failed</h1><p>The dashboard could not load scan results.</p><pre style='white-space:pre-wrap;background:#f5f5f5;padding:1rem;border-radius:6px'>{safe_error}</pre><button onclick='location.reload()' style='padding:10px 18px;cursor:pointer'>Retry</button></body></html>"
+                    self.wfile.write(body.encode("utf-8"))
+                    return
+
+                if not results:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(b"<html><body><h1>Loading...</h1><script>setTimeout(function(){location.reload();}, 3000);</script></body></html>")
+                    return
+                
+                html = generate_html_v2(results, scan_time, MARKET_OPEN, MARKET_CLOSE,
+                                         best_available=scan_state.get("best_available"),
+                                         rejection_funnel=scan_state.get("rejection_funnel"),
+                                         debug=debug, settings=settings.get("settings", {}))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(html.encode())
+                
+            elif self.path.startswith("/api/positions"):
+                positions = positions_module.list_positions()
+                payload = json.dumps({"positions": positions}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            elif self.path.startswith("/api/live_prices"):
+                payload = json.dumps({"prices": scan_state["live_prices"]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            elif self.path.startswith("/api/backtest/status"):
+                bt = scan_state.get("backtest", {})
+                payload = json.dumps({
+                    "running": bt.get("running", False),
+                    "message": bt.get("message", ""),
+                    "output": bt.get("output", ""),
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            elif self.path.startswith("/api/scan/status"):
+                payload = json.dumps({"running": scan_state["running"]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+                
+            elif self.path.startswith("/api/scan"):
+                from auto_select import select_stocks, write_config
+                parsed = urlparse(self.path)
+                params = parse_qs(parsed.query)
+                cfg_live = load_config(config_path)
+                s = cfg_live.get("settings", {}) if isinstance(cfg_live, dict) else {}
+                default_top = int(s.get("watchlist_size", 30))
+                max_sym = int(s.get("max_symbols", 40))
+                top_n = int(params.get("top", [str(default_top)])[0])
+                top_n = max(1, min(top_n, max_sym))
+                
+                if scan_state["running"]:
+                    payload = json.dumps({"status": "running"}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                
+                scan_state["running"] = True
+                
+                def _run_scan():
+                    try:
+                        with open(config_path) as f:
+                            cfg = json.load(f)
+                        symbols, ranked = select_stocks(cfg.get("settings", {}), top_n=top_n)
+                        write_config(symbols, config_path)
+                        compute_and_cache(scan_state, config_path)
+                    except Exception as exc:
+                        print(f"Scan error: {exc}")
+                    finally:
+                        scan_state["running"] = False
+                
+                threading.Thread(target=_run_scan, daemon=True).start()
+                payload = json.dumps({"status": "started"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+            else:
+                self.send_response(404)
+                self.end_headers()
+        
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                body = json.loads(raw or b"{}")
+            except Exception:
+                body = {}
+
+            def _json(status, obj):
+                payload = json.dumps(obj).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            if parsed.path == "/api/backtest":
+                bt = scan_state.setdefault("backtest", {"running": False, "message": "", "output": ""})
+                if bt.get("running"):
+                    _json(200, {"status": "running"})
+                    return
+
+                bt["running"] = True
+                bt["message"] = "Starting backtest..."
+                bt["output"] = ""
+
+                def _run_backtest():
+                    import io
+                    import contextlib
+                    try:
+                        with open(config_path) as f:
+                            cfg = json.load(f)
+                        bt_settings = cfg.get("settings", {})
+                        symbols = [s["symbol"] for s in cfg.get("stocks", []) if s.get("symbol")]
+                        if not symbols:
+                            bt["message"] = "No stocks in config - run Scan first."
+                            return
+
+                        # 1. Ensure history is cached (download if missing).
+                        from backtest import history as bt_history
+                        from backtest import run as bt_run
+                        from backtest import sweep as bt_sweep
+                        from backtest.data_shim import HistoryStore
+
+                        store = HistoryStore()
+                        missing = [s for s in symbols if not store.load_symbol(s)]
+                        if missing:
+                            bt["message"] = (f"Downloading history for {len(missing)} symbol(s) "
+                                             f"(first time only, several minutes)...")
+                            for i, sym in enumerate(missing, 1):
+                                bt["message"] = (f"Downloading history {i}/{len(missing)}: {sym} "
+                                                 f"(this is slow, please wait)...")
+                                try:
+                                    bt_history.fetch_symbol(sym, months=6)
+                                except Exception as exc:
+                                    print(f"[backtest] history fetch failed for {sym}: {exc}")
+
+                        # 2. Baseline run + 3. Sweep, capturing their printed output.
+                        bt["message"] = "Running backtest + comparing settings (this is the slow part)..."
+                        buf = io.StringIO()
+                        try:
+                            from engine import normalize_settings
+                            norm = normalize_settings(bt_settings)
+                        except Exception:
+                            norm = bt_settings
+                        with contextlib.redirect_stdout(buf):
+                            trades = bt_run.replay_module.replay_universe(symbols, norm)
+                            report = bt_run.metrics_module.full_report(trades)
+                            print(bt_run.metrics_module.render_report(report))
+                            print("\n" + "=" * 60)
+                            print("SETTINGS COMPARISON (strict vs looser):")
+                            print("=" * 60)
+                            sweep_res = bt_sweep.run_sweep(symbols, norm)
+                            print(bt_sweep.render_sweep(sweep_res))
+                        bt["output"] = buf.getvalue() or "(no output - likely no cached data)"
+                        bt["message"] = "Done. Read the RECOMMENDATION line at the bottom."
+                    except Exception as exc:
+                        bt["message"] = f"Backtest error: {exc}"
+                        bt["output"] = str(exc)
+                        print(f"[backtest] error: {exc}")
+                    finally:
+                        bt["running"] = False
+
+                threading.Thread(target=_run_backtest, daemon=True).start()
+                _json(200, {"status": "started"})
+                return
+
+            if parsed.path == "/api/positions/open":
+                try:
+                    settings = load_config(config_path).get("settings", {})
+                    pos = positions_module.open_position(
+                        symbol=body.get("symbol", ""),
+                        direction=body.get("direction", ""),
+                        settings=settings,
+                        entry_price=body.get("entry_price"),
+                        entry_price_low=body.get("entry_price_low"),
+                        entry_price_high=body.get("entry_price_high"),
+                        quantity=body.get("quantity"),
+                        amount_invested=body.get("amount_invested"),
+                        account_size=body.get("account_size"),
+                        risk_percent=body.get("risk_percent"),
+                        notify_enabled=body.get("notify_enabled", True),
+                        exchange=body.get("exchange", "nse"),
+                        notes=body.get("notes"),
+                    )
+                    _json(200, pos)
+                except Exception as exc:
+                    _json(400, {"error": str(exc)})
+                return
+
+            if parsed.path == "/api/positions/close":
+                pos = positions_module.close_position(
+                    body.get("id"), exit_price=body.get("exit_price"),
+                    reason=body.get("reason", "MANUAL_CLOSE"),
+                )
+                if pos is None:
+                    _json(404, {"error": "position not found or already closed"})
+                else:
+                    _json(200, pos)
+                return
+
+            if parsed.path == "/api/positions/remove":
+                ok = positions_module.delete_position(body.get("id"))
+                if not ok:
+                    _json(404, {"error": "position not found"})
+                else:
+                    _json(200, {"removed": True})
+                return
+
+            if parsed.path == "/api/positions/acknowledge":
+                pos = positions_module.acknowledge_alert(body.get("id"))
+                if pos is None:
+                    _json(404, {"error": "position not found"})
+                else:
+                    _json(200, pos)
+                return
+
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    scan_state["computing"] = True
+    threading.Thread(target=compute_and_cache, args=(scan_state, config_path), daemon=True).start()
+
+    # Positions are typically few (1-5 open trades), so they're checked on
+    # their own faster, independent cycle rather than waiting on the much
+    # heavier full-watchlist scan (which may only run every 60s+). This is
+    # what makes exit alerts feel "instant" - default every 20s, tunable via
+    # settings.position_check_interval_seconds. Cheap on the rate limiter:
+    # each open position costs ~2 calls (candles + quote), so even 5 open
+    # positions is ~10 calls per cycle.
+    def _position_checker_loop():
+        while True:
+            interval = 20
+            try:
+                settings = load_config(config_path).get("settings", {})
+                interval = max(5, int(settings.get("position_check_interval_seconds", 20)))
+                positions_module.check_all_open_positions(settings)
+            except Exception as exc:
+                print(f"Position check error: {exc}")
+            time.sleep(interval)
+
+    threading.Thread(target=_position_checker_loop, daemon=True).start()
+
+    # The full indicator scan (compute_and_cache) can legitimately take
+    # 25-90+ seconds depending on watchlist size and cache state, since it
+    # pulls 1d/15m/5m candles for every stock. But the raw "current price"
+    # shown on each card doesn't need any of that - it's a single cheap
+    # LTP lookup. Coupling price freshness to the full scan cycle meant
+    # the displayed price could be 60-150+ seconds stale even though a
+    # fresh quote was one small API call away. This loop fetches ONLY
+    # quotes, for whatever's currently in the watchlist, on a fast
+    # independent cadence (default 10s, just past the 8s quote cache TTL)
+    # so the price shown is never more than ~10-15s old, regardless of
+    # how long the heavier indicator scan is taking.
+    def _live_price_loop():
+        while True:
+            interval = 10
+            try:
+                cfg = load_config(config_path)
+                settings = cfg.get("settings", {})
+                interval = max(5, int(settings.get("live_price_refresh_seconds", 10)))
+                symbols = [s.get("symbol") for s in cfg.get("stocks", []) if s.get("symbol")]
+                fresh = {}
+                for sym in symbols:
+                    try:
+                        q = DataProvider.get_realtime_quote(sym, exchange="nse") or {}
+                        price = q.get("last_price")
+                        if price is not None:
+                            fresh[sym] = {"price": price, "timestamp": dt.datetime.now().isoformat(timespec="seconds")}
+                    except Exception:
+                        continue  # one bad symbol shouldn't stop the rest
+                scan_state["live_prices"].update(fresh)
+            except Exception as exc:
+                print(f"Live price loop error: {exc}")
+            time.sleep(interval)
+
+    threading.Thread(target=_live_price_loop, daemon=True).start()
+
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    print(f"Dashboard V2 running on http://localhost:{port}")
+    print(f"Config: {config_path}")
+    print(f"Stocks: {len(_start.get('stocks', []))}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Intraday Dashboard V2")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    args = parser.parse_args()
+    run_dashboard(args.config, args.port)
+
+if __name__ == "__main__":
+    main()

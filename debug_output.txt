@@ -1,0 +1,10 @@
+[I 260821 10:56:46 smartConnect:124] in pool
+--- Fetching 1d data ---
+1d candles count: 23
+--- Fetching 15m data ---
+15m candles count: 100
+--- Fetching 5m data ---
+5m candles count: 100
+
+--- Fetching LTP ---
+Quote: {'symbol': 'HDFCBANK', 'symbol_input': 'HDFCBANK', 'exchange': 'NSE', 'market': 'INDIA', 'last_price': 731.75, 'previous_close': 725.05, 'open': 728.3, 'day_high': 732.8, 'day_low': 726.6, 'volume': 0, 'timestamp': '2026-08-21T10:56:46.952671+05:30', 'source': 'angelone'}
