@@ -23,6 +23,11 @@ import positions as positions_module
 
 DEFAULT_CONFIG = "intraday_config.json"
 DEFAULT_PORT = 8080
+import zoneinfo
+_IST = zoneinfo.ZoneInfo("Asia/Kolkata")
+def _now_ist():
+    return dt.datetime.now(_IST).replace(tzinfo=None)
+
 def compute_and_cache(scan_state, config_path):
     """Evaluate all stocks and cache results. Must be called with explicit scan_state."""
     try:
@@ -99,7 +104,7 @@ def compute_and_cache(scan_state, config_path):
         scan_state["results"] = results
         scan_state["rejection_funnel"] = funnel
         scan_state["best_available"] = best_available
-        scan_state["scan_time"] = dt.datetime.now()
+        scan_state["scan_time"] = _now_ist()
     except Exception as e:
         error_message = str(e) or e.__class__.__name__
         print(f"Compute error: {error_message}")
@@ -223,7 +228,7 @@ def _trade_plan_panel(results, settings, now_t):
 def generate_html_v2(results, scan_time, market_open, market_close, watchlist_ranked=None, rejection_funnel=None, best_available=None, debug=False, settings=None):
     """Clean HTML generation with proper structure."""
     _settings = settings or {}
-    now = dt.datetime.now()
+    now = _now_ist()
     now_t = now.time()
     in_market = market_open <= now_t <= market_close
     _watchlist_size = _settings.get("watchlist_size", 30)
@@ -1236,9 +1241,9 @@ def run_dashboard(config_path, port):
             
             if parsed.path in ("/", "/index.html"):
                 results = scan_state.get("results", [])
-                scan_time = scan_state.get("scan_time") or dt.datetime.now()
+                scan_time = scan_state.get("scan_time") or _now_ist()
                 compute_error = scan_state.get("compute_error")
-                now = dt.datetime.now()
+                now = _now_ist()
                 cfg_stocks = load_config(config_path).get("stocks", [])
 
                 # Empty watchlist: show an actionable message instead of looping
@@ -1561,7 +1566,7 @@ def run_dashboard(config_path, port):
                         q = DataProvider.get_realtime_quote(sym, exchange="nse") or {}
                         price = q.get("last_price")
                         if price is not None:
-                            fresh[sym] = {"price": price, "timestamp": dt.datetime.now().isoformat(timespec="seconds")}
+                            fresh[sym] = {"price": price, "timestamp": _now_ist().isoformat(timespec="seconds")}
                     except Exception:
                         continue  # one bad symbol shouldn't stop the rest
                 scan_state["live_prices"].update(fresh)
