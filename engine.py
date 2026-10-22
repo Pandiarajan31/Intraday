@@ -53,8 +53,7 @@ def _engine_now() -> dt.datetime:
             return _bt_clock.now_naive()
     except Exception:
         pass
-    return dt.datetime.now()
-
+    return dt.datetime.now(zoneinfo.ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
 
 # ---------------------------------------------------------------------------
 # #16 Primary rejection reason — fixed priority order (expert review doc #16)
