@@ -55,6 +55,7 @@ def _engine_now() -> dt.datetime:
         pass
     return dt.datetime.now(zoneinfo.ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
 
+
 # ---------------------------------------------------------------------------
 # #16 Primary rejection reason — fixed priority order (expert review doc #16)
 # A WAIT/ALMOST is explained by the HIGHEST-priority FAIL, with the rest
